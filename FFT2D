@@ -1,0 +1,235 @@
+import numpy as np 
+import matplotlib.pyplot as plt 
+import pandas as pd 
+import seaborn as sns
+from scipy.ndimage import rotate 
+import rasterio
+import math
+import os
+
+# =============================================================================
+# Import Raster
+# =============================================================================
+
+from PIL import Image 
+Image.MAX_IMAGE_PIXELS = 2726952960
+
+corrective_raster_path = "Raster.tif"
+
+im = Image.open(corrective_raster_path) 
+croppedarray =  np.array(im)
+croppedarray = croppedarray.astype(np.float64)
+croppedarray[croppedarray < -5000] = 0
+
+with rasterio.open(corrective_raster_path) as src:
+    source_transform = src.transform
+    source_crs = src.crs
+    source_profile = src.profile
+
+# =============================================================================
+# Perform 2D FFT
+# =============================================================================
+
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+fft_2d_result = np.fft.fft2(croppedarray)
+FreqCompRows = np.fft.fftfreq(croppedarray.shape[1],d=2)
+fft_2d_shifted = np.fft.fftshift(fft_2d_result)
+magnitude_spectrum_NL = np.abs(fft_2d_shifted)
+unshift_mag = np.abs(fft_2d_result)
+
+filtered_fft_2d_result = fft_2d_result.copy()
+
+# =============================================================================
+# Create Filter
+# =============================================================================
+
+def calculate_new_bearing(original_bearing, l, L, stretch_to_square="LxL"):
+    """
+    Calculate the new bearing of a line after stretching a raster to a square.
+    
+    Parameters:
+        original_bearing (float): The original bearing of the line (in degrees).
+        l (float): The shorter dimension of the raster.
+        L (float): The longer dimension of the raster.
+        stretch_to_square (str): "LxL" or "lxL" to specify the target square.
+        
+    Returns:
+        float: The new bearing (in degrees).
+    """
+    # Convert bearing to radians
+    theta_rad = math.radians(original_bearing)
+    
+    # Compute stretch factors
+    if stretch_to_square == "LxL":
+        S_x = L / l
+        S_y = 1
+    elif stretch_to_square == "lxl":
+        S_x = 1
+        S_y = l / L
+    else:
+        raise ValueError("Invalid stretch_to_square value. Use 'LxL' or 'lxL'.")
+    
+    # Calculate the new slope
+    tan_theta_new = math.tan(theta_rad) * S_y / S_x
+    
+    # Calculate the new bearing in degrees
+    new_bearing_rad = math.atan(tan_theta_new)
+    new_bearing_deg = math.degrees(new_bearing_rad)
+    
+    # Ensure the bearing is in the range [0, 360]
+    if new_bearing_deg < 0:
+        new_bearing_deg += 180
+    
+    return new_bearing_deg
+
+filter_width = 2
+spacing = 10
+
+low_pass = np.zeros((max(fft_2d_result.shape),max(fft_2d_shifted.shape))) #make it square so there is no problem when rotating
+center = (low_pass.shape[0] // 2, low_pass.shape[1] // 2)
+low_pass[0:center[0]-spacing,center[1]-1*filter_width:center[1]+1*filter_width]=1
+low_pass[center[0]+spacing:,center[1]-1*filter_width:center[1]+1*filter_width]=1
+
+original_bearing = 57.3
+transformed_bearing = calculate_new_bearing(original_bearing, fft_2d_shifted.shape[0], fft_2d_shifted.shape[1], stretch_to_square="LxL")
+
+target_shape = fft_2d_shifted.shape
+
+low_pass = rotate(low_pass, 90-transformed_bearing)
+low_pass = low_pass[(low_pass.shape[0]//2)-(target_shape[0]//2):(low_pass.shape[0]//2)+(target_shape[0]//2)+1,
+                    (low_pass.shape[1]//2)-(target_shape[1]//2):(low_pass.shape[1]//2)+(target_shape[1]//2)]
+
+# =============================================================================
+# Apply the filter to the FFT data
+# =============================================================================
+
+filtered_fft_2d_result = fft_2d_result * np.fft.ifftshift(low_pass)
+
+filtered_2d_signal = np.fft.ifft2(filtered_fft_2d_result)
+filtered_2d_magnitude = np.abs(filtered_fft_2d_result)
+filtered_2d_magnitude_shifted = np.fft.fftshift(filtered_fft_2d_result)
+np.fft.ifftshift(low_pass)
+filtered_2d_magnitude_spectrum_shifted =np.abs(filtered_2d_magnitude_shifted)
+Treated = croppedarray-filtered_2d_signal.real
+
+# =============================================================================
+# Filter QC
+# =============================================================================
+
+fig1, (ax1,ax0,ax2 ) = plt.subplots(3,1, figsize =(10,30))
+im1 = ax1.imshow(magnitude_spectrum_NL, cmap='gray', aspect='auto',vmin = 0.000, vmax = 50000)#,vmin = 0.000*10**9, vmax = 0.3*10**8)
+ax1.set_title('Magnitude Spectrum (2D FFT)')
+divider1 = make_axes_locatable(ax1)
+cax1 = divider1.append_axes("right", size="1%", pad=0.05)
+cbar1 = plt.colorbar(im1, cax=cax1)
+ax1.set_xlim((target_shape[1]//2)-200,(target_shape[1]//2)+200)
+ax1.set_ylim((target_shape[0]//2)-200,(target_shape[0]//2)+200)
+
+im0 = ax0.imshow(low_pass, cmap='gray', aspect='auto',vmin = 0.000, vmax = 1)#,vmin = 0.000*10**9, vmax = 0.3*10**8)
+ax0.set_title('Low-Pass Filter')
+divider0 = make_axes_locatable(ax0)
+cax0 = divider0.append_axes("right", size="1%", pad=0.05)
+cbar0 = plt.colorbar(im0, cax=cax0)
+ax0.set_xlim((target_shape[1]//2)-200,(target_shape[1]//2)+200)
+ax0.set_ylim((target_shape[0]//2)-200,(target_shape[0]//2)+200)
+
+im2 = ax2.imshow(filtered_2d_magnitude_spectrum_shifted, cmap='gray', aspect='auto',vmin = 0.000, vmax = 50000)#,vmin = 0.000*10**9, vmax = 0.3*10**8)
+ax2.set_title('Filtered Magnitude Spectrum (2D FFT)')
+divider2 = make_axes_locatable(ax2)
+cax2 = divider2.append_axes("right", size="1%", pad=0.05)
+cbar2 = plt.colorbar(im2, cax=cax2)
+ax2.set_xlim((target_shape[1]//2)-200,(target_shape[1]//2)+200)
+ax2.set_ylim((target_shape[0]//2)-200,(target_shape[0]//2)+200)
+
+# =============================================================================
+# QC along an arbitrary line
+# =============================================================================
+
+fig2, axes = plt.subplots(2,1, figsize =(30,13.3))
+plot = sns.lineplot(ax = axes[0],x = np.arange(0, len(croppedarray[center[0]])) , y = croppedarray[center[0]], linewidth=2.5)
+plot = sns.lineplot(ax = axes[0],x = np.arange(0, len(croppedarray[center[0]])) , y = Treated[center[0]], linewidth=2.5, color =  'red')
+axes[0].set_ylabel("Depth (m)")
+axes[0].set_xlabel("Sample at Y = 605")
+# axes[0].set_ylim( -0.4,  0.4)
+# axes[0].set_xlim(-20,len(croppedarray)+20)
+
+plot = sns.lineplot(ax = axes[1],x =  np.arange(0, len(croppedarray[center[0]]))-center[1], y = magnitude_spectrum_NL[center[0],:magnitude_spectrum_NL.shape[1]], linewidth=2.5) # np.sort(FreqCompRows)
+plot = sns.lineplot(ax = axes[1],x =  np.arange(0, len(croppedarray[center[0]]))-center[1], y = magnitude_spectrum_NL[center[0],:magnitude_spectrum_NL.shape[1]]-filtered_2d_magnitude_spectrum_shifted[center[0],:filtered_2d_magnitude_spectrum_shifted.shape[1]], linewidth=2.5, color =  'red') #np.sort(FreqCompRows)
+# plot = sns.lineplot(ax = axes[1],x = frequency[:len(frequency)//2], y = magnitude[:len(magnitude)//2], linewidth=2.5) #*fs
+axes[1].set_ylabel("Magnitude")
+axes[1].set_xlabel("Frequency")
+axes[1].set_xlim(-0.0001, 0.250)
+
+# =============================================================================
+# Display Raster HPF and LPF
+# =============================================================================
+
+fig3, (ax1,ax2,ax3) = plt.subplots(3,1, figsize =(21,29.7))
+im1 = ax1.imshow(croppedarray, cmap='gray', aspect='auto',vmin = -0.7, vmax = 0.4)#,vmin = 0.000*10**9, vmax = 0.3*10**8)
+ax1.set_title('Original Data')
+divider1 = make_axes_locatable(ax1)
+cax1 = divider1.append_axes("right", size="1%", pad=0.05)
+cbar1 = plt.colorbar(im1, cax=cax1)
+
+im2 = ax2.imshow(filtered_2d_signal.real, cmap='gray', aspect='auto',vmin = -0.7, vmax = 0.4)#,vmin = 0.000*10**9, vmax = 0.3*10**8)
+ax2.set_title('Filtered Data HPF')
+divider2 = make_axes_locatable(ax2)
+cax2 = divider2.append_axes("right", size="1%", pad=0.05)
+cbar2 = plt.colorbar(im2, cax=cax2)
+
+im3 = ax3.imshow(croppedarray-filtered_2d_signal.real, cmap='gray', aspect='auto',vmin = -0.7, vmax = 0.4)#,vmin = 0.000*10**9, vmax = 0.3*10**8)
+ax3.set_title('Filtered Data LPF')
+divider3 = make_axes_locatable(ax3)
+cax3 = divider3.append_axes("right", size="1%", pad=0.05)
+cbar3 = plt.colorbar(im3, cax=cax3)
+
+# =============================================================================
+# Apply corrections to the original raster
+# =============================================================================
+
+tocorrect_raster_path = "E:/temp/LPF100_ZB.tif"
+
+# Open the original raster and apply the georeferencing information
+with rasterio.open(tocorrect_raster_path) as orig:
+    data = orig.read()  # Read the raster data
+    profile = orig.profile
+    data = data[0]
+    data = data[:data.shape[0]//2,
+                :data.shape[1]//2]
+    corr_data = data+(croppedarray-filtered_2d_signal.real)
+    data_mask = np.ones(corr_data.shape)
+    data_mask[corr_data<=-5000]=np.nan
+    data_mask[corr_data>=0]=np.nan
+    corr_data = corr_data * data_mask
+
+    # Write the updated raster to a new file
+    with rasterio.open("E:/temp/BatCor_results/Corrected_DEM.tif", "w", **profile) as dst:
+        dst.write(corr_data)
+
+print("Georeferenced raster saved to E:/temp/BatCor_results/Corrected_DEM.tif")
+
+
+FFT_LPF_Result = Image.fromarray(croppedarray-filtered_2d_signal.real)
+FFT_LPF_Result.save("E:/temp/BatCor_results/FFT_LPF_Result.tif")
+
+with rasterio.open("E:/temp/BatCor_results/FFT_LPF_Result.tif") as unref:
+    data = unref.read()  # Read the raster data
+    profile = unref.profile
+
+    # Update the profile with georeferencing information
+    profile.update(
+        transform=source_transform,
+        crs=source_crs,
+        driver=source_profile["driver"],  # Preserve original driver
+    )
+
+    data = data * data_mask
+
+    # Write the updated raster to a new file
+    with rasterio.open("E:/temp/BatCor_results/FFT_LPF_Result_Georef.tif", "w", **profile) as dst:
+        dst.write(data)
+
+os.remove("E:/temp/BatCor_results/FFT_LPF_Result.tif")
+print("Georeferenced raster saved to E:/temp/BatCor_results/FFT_LPF_Result_Georef.tif")
+

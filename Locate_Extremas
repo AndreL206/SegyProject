@@ -1,0 +1,98 @@
+import numpy as np
+import rasterio
+import geopandas as gpd
+from rasterio import features
+from shapely.geometry import Point, Polygon
+from skimage.measure import find_contours
+
+voronoi_gdf = gpd.read_file("Voronoi.shp")
+
+# =============================================================================
+# Load DEM 
+# =============================================================================
+
+with rasterio.open("Raster.tiff") as src:
+    dem = src.read(1)
+    profile = src.profile
+    transform = src.transform
+
+# =============================================================================
+# Extract Extreme Point 
+# =============================================================================
+
+def extract_extreme_point(polygon, dem, transform, find_lowest):
+    # Create a mask for the polygon
+    mask = features.geometry_mask(
+        [polygon],
+        out_shape=dem.shape,
+        transform=transform,
+        invert=True,
+    )
+    
+    # Masked DEM
+    masked_dem = np.where(mask, dem, np.nan)
+    
+    if find_lowest:
+        extreme_value = np.nanmin(masked_dem)
+        extreme_index = np.unravel_index(np.nanargmin(masked_dem), dem.shape)
+    else:
+        extreme_value = np.nanmax(masked_dem)
+        extreme_index = np.unravel_index(np.nanargmax(masked_dem), dem.shape)
+    
+    extreme_coords = rasterio.transform.xy(transform, extreme_index[0], extreme_index[1])
+    return extreme_coords, extreme_value
+
+highest_lowest_points = []
+for idx, row in voronoi_gdf.iterrows():
+    polygon = row.geometry
+    find_lowest = row.Type == "Pockmark" if row.Type else False
+    coords, value = extract_extreme_point(polygon, dem, transform, find_lowest)
+    highest_lowest_points.append({"Type": row.Type, "coords": Point(coords), "value": value})
+
+# Create GeoDataFrame for extreme points
+extreme_points_gdf = gpd.GeoDataFrame(highest_lowest_points)
+extreme_points_gdf.set_geometry("coords", inplace=True)
+extreme_points_gdf.set_crs(voronoi_gdf.crs, inplace=True)
+extreme_points_gdf.to_file("Corrected_Points.shp")
+
+# =============================================================================
+# Extract contour
+# =============================================================================
+
+def extract_contour(polygon, dem, transform, level_percentile,  contour_buffer_size):
+    # Create a mask for the polygon
+    mask = rasterio.features.geometry_mask(
+        [polygon],
+        out_shape=dem.shape,
+        transform=transform,
+        invert=True,
+    )
+    # Masked DEM
+    masked_dem = np.where(mask, dem, np.nan)
+
+    # Use contouring to extract the feature boundary
+    level = np.nanpercentile(masked_dem, level_percentile)
+    contours = find_contours(masked_dem, level=level)
+    if not contours:
+        return None
+
+    # Convert largest contour to polygon
+    largest_contour = max(contours, key=len)
+    contour_coords = [rasterio.transform.xy(transform, int(c[0]), int(c[1])) for c in largest_contour]
+    contour_polygon = Polygon(contour_coords)
+    
+    # Apply buffer to the contour polygon
+    buffered_contour_polygon = contour_polygon.buffer(contour_buffer_size)
+    return buffered_contour_polygon    
+
+feature_polygons = []
+for idx, row in voronoi_gdf.iterrows():
+    polygon = row.geometry
+    contour = extract_contour(polygon, dem, transform, 90, 5)
+    if contour and contour.is_valid:
+        feature_polygons.append({"id": row.fid, "geometry": contour})
+
+# Create GeoDataFrame for feature envelopes
+feature_envelopes_gdf = gpd.GeoDataFrame(feature_polygons)
+feature_envelopes_gdf.set_crs(voronoi_gdf.crs, inplace=True)
+feature_envelopes_gdf.to_file("E:/temp/feature_envelopes2.shp")
